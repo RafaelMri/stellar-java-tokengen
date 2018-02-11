@@ -92,8 +92,8 @@ public class App {
             }
 
             try {
-                String[] keybaseSign = new String[]{"ipfs", "add", filePath};
-                Process proc = new ProcessBuilder(keybaseSign).start();
+                String[] ipfsUp = new String[]{"ipfs", "add", filePath};
+                Process proc = new ProcessBuilder(ipfsUp).start();
                 InputStream is = proc.getInputStream();
                 BufferedReader reader = new BufferedReader(new InputStreamReader(is));
                 final String[] split = reader.readLine().split(" ");
