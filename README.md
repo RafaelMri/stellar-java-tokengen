@@ -15,7 +15,7 @@ Important step before running:
 * Copy src/main/resources/template.properties to src/main/resources/ico.properties
 * Change values in ico.properties to fill the needs
 * No Windows support yet
-* You will need at least to have ipfs install: https://ipfs.io/docs/install/
+* You will need at least to have ipfs installed: https://ipfs.io/docs/install/
 
 ## Build and run
 
