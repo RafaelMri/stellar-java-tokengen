@@ -1,15 +1,17 @@
 package de.danieldeusing.stellar.tokengen.util;
 
-import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
 import java.util.Properties;
 
 public abstract class AppUtil {
     public static Properties getProperties() {
         Properties config = new Properties();
-        FileInputStream in = null;
+        URL resource = AppUtil.class.getClassLoader().getResource("ico.properties");
+        InputStream in = null;
         try {
-            in = new FileInputStream("conf/tokengen.properties");
+            in = resource.openStream();
             config.load(in);
             in.close();
         } catch (IOException e) {
