@@ -1,0 +1,5 @@
+.idea
+.gradle
+out
+conf/*.properties
+!conf/template.properties
