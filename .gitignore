@@ -1,5 +1,5 @@
 .idea
 .gradle
 out
-conf/*.properties
-!conf/template.properties
+src/main/resources/*.properties
+!src/main/resources/template.properties
