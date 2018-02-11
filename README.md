@@ -28,5 +28,5 @@ java -jar build/libs/stellar-tokengen-all-0.1.jar
 If you like the code, a donation would be appreciated. Even a single XLM!
 
 ```
-XLM: 
+XLM: GB7OE7PTL5FKRW6WXFGSDDOA7WR4HT6LPMKCQAWK7QXLSMCQWIKYTTY5
 ```
