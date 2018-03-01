@@ -1,6 +1,6 @@
 package de.danieldeusing.stellar.tokengen;
 
-import com.google.gson.Gson;
+import de.danieldeusing.stellar.tokengen.impl.AccountImpl;
 import de.danieldeusing.stellar.tokengen.impl.TokenDescImpl;
 import de.danieldeusing.stellar.tokengen.interfaces.IAccount;
 import de.danieldeusing.stellar.tokengen.types.AccountType;
@@ -10,22 +10,49 @@ import de.danieldeusing.stellar.tokengen.util.StellarUtil;
 import org.apache.commons.lang3.SystemUtils;
 import org.stellar.sdk.*;
 import org.stellar.sdk.responses.AccountResponse;
-import org.stellar.sdk.responses.SubmitTransactionResponse;
 
-import java.io.*;
-import java.nio.charset.Charset;
-import java.util.Properties;
+import java.io.IOException;
+import java.text.DecimalFormat;
+import java.util.*;
 
 public class App {
 
     public static void main(String[] args) {
+        if (args.length < 4 || (args.length % 2 != 0)) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Parameters not valid. Usage:\n");
+            sb.append(" -p ico.properties\n");
+            sb.append(" -t presale (available types are 'presale', 'aftersale', 'directico')\n");
+            sb.append("    if presale is selected, there will only be an issuer and an asset created with unlimited supply.\n");
+            sb.append("    if aftersale is selected, the already sold tokens are calculated and the issuing account is locked to its COIN_AMOUNT supply.\n");
+            sb.append("    if directico is selected, an issuer and all distribtion accounts are created.\n");
+            sb.append(" -s optional if not aftersale: secret seed of issuer\n");
+            sb.append(" -a optional if not aftersale: amount of assets already spent\n");
+            AppUtil.fatalError(sb.toString(), 0);
+        }
+
+        Map<String, String> paramsMap = new HashMap<>();
+        for (int i=0; i<args.length;i+=2) {
+            switch (args[i]) {
+                case "-p": paramsMap.put("properties", args[i+1]); break;
+                case "-t": paramsMap.put("type", args[i+1]); break;
+                case "-a": paramsMap.put("assets", args[i+1]); break;
+                case "-s": paramsMap.put("secret", args[i+1]); break;
+            }
+        }
+
+        if (paramsMap.get("type").equals("aftersale")
+                && (paramsMap.get("secret") == null || paramsMap.get("assets") == null)) {
+            AppUtil.fatalError("Type aftersale selected, but not ipub, iseed or assets given. Exit.", 0);
+        }
+
         // check if we are on linux/mac else quit
         if ( !(SystemUtils.IS_OS_LINUX || SystemUtils.IS_OS_MAC) ) {
             AppUtil.fatalError("Operating system not supported by this App. Exit.", -1);
         }
 
         // init some global stuff
-        Properties config = AppUtil.getProperties();
+        Properties config = AppUtil.getProperties(paramsMap.get("properties"));
         NetworkType network = NetworkType.valueOf(config.getProperty("NETWORK").toUpperCase());
         Server server = new Server(StellarUtil.getNetworkUrl(network));
 
@@ -39,154 +66,170 @@ public class App {
          * URL: https://www.stellar.org/blog/tokens-on-stellar/
          */
 
-        System.out.println("Token and Account creation started for " + network.name());
+        System.out.println("Token and Account creation started for " + network.name() + " and token " + config.getProperty("COIN_NAME"));
 
         // Step 1 – Create issuing account.
-        final IAccount issuer = AccountFactory.create(network, AccountType.ISSUER);
+        final IAccount issuer = getIssuer(paramsMap, network);
 
-        // Step 2 – Create distribution account.
-        final IAccount distributor = AccountFactory.create(network, AccountType.DISTRIBUTOR);
-
-        // Create Assed
+        // Create Asset
         final Asset appAsset = Asset.createNonNativeAsset(config.getProperty("COIN_CODE"), issuer.getKeyPair());
+        final Asset btcAsset = Asset.createNonNativeAsset("BTC", issuer.getKeyPair());
+        final Asset ethAsset = Asset.createNonNativeAsset("ETH", issuer.getKeyPair());
 
-        // Step 3 – Trust the issuing account
-        Transaction trust = new Transaction.Builder(getAccountResponse(server, distributor, 3))
-                .addOperation(
-                        new ChangeTrustOperation.Builder(appAsset, config.getProperty("COIN_AMOUNT")).build())
-                .build();   // the receiving account must trust the asset with maximum amount
-        performTx(server, distributor.getKeyPair(), trust, 3);
+        //if (paramsMap.get("type").equals("afterpresale") || paramsMap.get("type").equals("directico")) {
+            // Step 2 – Create distribution account.
+        List<IAccount> distributionAccounts = new ArrayList<>();
 
-        // Step 4 – Create tokens
-        Transaction send = new Transaction.Builder(getAccountResponse(server, issuer, 4))
-                .addOperation(
-                        new PaymentOperation.Builder(distributor.getKeyPair(), appAsset, config.getProperty("COIN_AMOUNT")).build())
-                .build();   // there has to be a payment to create the token. We send all from issuer to distributor
-        performTx(server, issuer.getKeyPair(), send, 4);
+        AppUtil.getCoinDistributionMap(config, paramsMap.get("assets")).forEach((k,v) -> {
+            final IAccount account = AccountFactory.create(k, network, AccountType.DISTRIBUTOR);
+
+            // Step 3 – Trust the issuing account
+            // Step 4 – Create tokens
+            createAccAndToken(server, account, appAsset, config, issuer, v, network);
+
+            if (account.getName().equals("presale")) {
+                // also trust BTC and ETH
+                trust(server, account, btcAsset, config);
+                trust(server, account, ethAsset, config);
+            }
+
+            distributionAccounts.add(account);
+        });
+
+        //} else {
+        //    final IAccount initAccount = AccountFactory.create("initUser", network, AccountType.USER);
+        //    createAccAndToken(server, initAccount, appAsset, config, issuer, "41", network);
+        //}
 
         // Step 5 – Publish information about your token
-        Gson gson = new Gson();
         TokenDescImpl appTokenDesc = new TokenDescImpl(
                 config.getProperty("COIN_CODE"),
                 config.getProperty("COIN_NAME"),
                 config.getProperty("COIN_DESCRIPTION"),
-                config.getProperty("COIN_CONDITIONS"));
-        try {
-            String filePath = "/tmp/appToken.json";
-            FileWriter fileWriter = new FileWriter(filePath);
-            gson.toJson(appTokenDesc, fileWriter);
-            fileWriter.close();
-
-            try {
-                String[] keybaseLogin = new String[]{"keybase", "login", config.getProperty("KEYBASE_USER")};
-                Process proc = new ProcessBuilder(keybaseLogin).start();
-            } catch (IOException e) {
-                System.out.println("Keybase not installed. We will continue for now with an unsigned document.");
-            }
-
-            try {
-                String[] keybaseSign = new String[]{"keybase", "pgp", "sign", "-i", filePath};
-                Process proc = new ProcessBuilder(keybaseSign).start();
-            } catch (IOException e) {
-                System.out.println("Sign failed. We dont care right now and continue to upload unsigned file.");
-            }
-
-            try {
-                String[] ipfsUp = new String[]{"ipfs", "add", filePath};
-                Process proc = new ProcessBuilder(ipfsUp).start();
-                InputStream is = proc.getInputStream();
-                BufferedReader reader = new BufferedReader(new InputStreamReader(is));
-                final String[] split = reader.readLine().split(" ");
-                if (split.length != 3) {
-                    AppUtil.fatalError("IPFS upload failed. Exit.", 51);
-                }
-                String ipfsHash = split[1];
-                System.out.println("IPFS location: https://ipfs.io/ipfs/" + ipfsHash);
-
-                Transaction t = new Transaction.Builder(getAccountResponse(server, issuer, 5))
-                        .addOperation(
-                                new ManageDataOperation.Builder("issue", ipfsHash.getBytes(Charset.forName("UTF-8"))).build())
-                        .build();   // there has to be a payment to create the token. We send all from issuer to distributor
-                performTx(server, issuer.getKeyPair(), t, 5);
-            } catch (IOException e) {
-                AppUtil.fatalError("IPFS not installed. Exit.", 52);
-            }
-        } catch (IOException e) {
-            // we could provide a solution without file creation ...
-            // final String appTokenDescJson = gson.toJson(appTokenDesc);
-            AppUtil.fatalError("Json file could not be created. Exit.", 53);
+                config.getProperty("COIN_CONDITIONS"),
+                config.getProperty("COIN_IMAGEURL"),
+                issuer.getKeyPair().getAccountId(),
+                config.getProperty("COIN_SHOWDECIMALS"));
+        if (Boolean.valueOf(config.getProperty("APP_IPFS"))) {
+            String keybase = config.getProperty("KEYBASE_USER");
+            StellarUtil.ipfsMeta(appTokenDesc, server, issuer, keybase, 5);
+        }
+        if (Boolean.valueOf(config.getProperty("APP_TOML"))) {
+            StellarUtil.tomlMeta(appTokenDesc, server, issuer, config.getProperty("APP_TOML_URL"), 5);
         }
 
-        // Step 6 – Limit the supply
-        Transaction limitSupply = new Transaction.Builder(getAccountResponse(server, issuer, 6))
-                .addOperation(
-                        new SetOptionsOperation.Builder().setMasterKeyWeight(0).build())
-                .build();   // set master weight of issuer to lock him to max COIN_AMOUNT
-        performTx(server, issuer.getKeyPair(), limitSupply, 6);
-        System.out.println("Account locked. Take a look at " + StellarUtil.getNetworkUrl(network)+ "/accounts/" + issuer.getKeyPair().getAccountId());
-
-
-        // Step 7 – Distribute your Token
-        Transaction distribute = new Transaction.Builder(getAccountResponse(server, distributor, 6))
-                .addOperation(
-                        new ManageOfferOperation.Builder(appAsset, new AssetTypeNative(), config.getProperty("COIN_AMOUNT"), config.getProperty("COIN_INIT_SELL_PRICE")).build())
-                .build();   // set master weight of issuer to lock him to max COIN_AMOUNT
-        performTx(server, distributor.getKeyPair(), distribute, 7);
-        System.out.println("---------------------------------");
-        System.out.println("Token created.");
-        if (network.equals(NetworkType.TESTNET)) {
-            System.out.println("First open https://stellarterm.com/#testnet and open then in the same tab the following URL:");
-        }
-        System.out.println("You can now trade it on https://stellarterm.com/#exchange/" + config.getProperty("COIN_CODE") +"-" + issuer.getKeyPair().getAccountId() + "/XLM-native");
-
-        // Step 8 - Create test Account which buys Tokens
-        if (network.equals(NetworkType.TESTNET) && Boolean.valueOf(config.getProperty("USER_ENABLED"))) {
-            final IAccount tester = AccountFactory.create(network, AccountType.USER);
-
-            Transaction trustUser = new Transaction.Builder(getAccountResponse(server, tester, 3))
+        if (paramsMap.get("type").equals("afterpresale") || paramsMap.get("type").equals("directico")) {
+            // Step 6 – Limit the supply
+            Transaction limitSupply = new Transaction.Builder(StellarUtil.getAccountResponse(server, issuer, 6))
                     .addOperation(
-                            new ChangeTrustOperation.Builder(appAsset, config.getProperty("COIN_AMOUNT")).build())
-                    .build();   // the receiving account must trust the asset with maximum amount
-            performTx(server, tester.getKeyPair(), trustUser, 8);
-
-            Transaction offerBuy = new Transaction.Builder(getAccountResponse(server, tester, 8))
-            .addOperation(
-                    new ManageOfferOperation.Builder(new AssetTypeNative(), appAsset, config.getProperty("USER_OFFER_SELL_AMOUNT"), config.getProperty("USER_OFFER_PRICE_SELL")).build())
-            .build();   // set master weight of issuer to lock him to max COIN_AMOUNT
-            performTx(server, tester.getKeyPair(), offerBuy, 8);
-
-            Transaction offerBid = new Transaction.Builder(getAccountResponse(server, tester, 8))
-                    .addOperation(
-                            new ManageOfferOperation.Builder(new AssetTypeNative(), appAsset, config.getProperty("USER_OFFER_SELL_AMOUNT"), config.getProperty("USER_OFFER_PRICE_SOLD")).build())
+                            new SetOptionsOperation.Builder().setMasterKeyWeight(0).build())
                     .build();   // set master weight of issuer to lock him to max COIN_AMOUNT
-            performTx(server, tester.getKeyPair(), offerBid, 8);
-            System.out.println("Checkout my balance: " + StellarUtil.getNetworkUrl(network)+ "/accounts/" + tester.getKeyPair().getAccountId());
+            StellarUtil.performTx(server, issuer.getKeyPair(), limitSupply, 6);
+            System.out.println("Account locked. Take a look at " + StellarUtil.getNetworkUrl(network) + "/accounts/" + issuer.getKeyPair().getAccountId());
         }
-    }
 
-    // export to method because of IOException
-    private static AccountResponse getAccountResponse(Server server, IAccount account, Integer actualStep) {
-        try {
-            return server.accounts().account(account.getKeyPair());
-        } catch (IOException e) {
-            AppUtil.fatalError("Account not found int the stellar network.", actualStep);
-        }
-        // we never can get here because fatalError does exit, but compiler strangely complains.
-        return null;
-    }
-
-    private static void performTx(Server server, KeyPair sKeyPair, Transaction t, Integer actualStep) {
-        t.sign(sKeyPair);
-
-        final SubmitTransactionResponse submitTransactionResponse;
-        try {
-            submitTransactionResponse = server.submitTransaction(t);
-            if (!submitTransactionResponse.isSuccess()) {
-                AppUtil.fatalError("Transaction was not successful.", actualStep);
+        if (config.getProperty("COIN.DIRECT_DISTRIBUTION") != null && Boolean.valueOf(config.getProperty("COIN.DIRECT_DISTRIBUTION"))) {
+            // Step 7 – Distribute your Token
+            final Optional<IAccount> presale = distributionAccounts.stream().filter(d -> d.getName().equalsIgnoreCase("presale")).findFirst();
+            if (!presale.isPresent()) {
+                AppUtil.fatalError("No presale Account found. Exit", 7);
             }
-        } catch (IOException | NullPointerException e) {
-            AppUtil.fatalError(e, actualStep);
-        }
 
+            String balance = "0";
+
+            try {
+                final Optional<AccountResponse.Balance> coin_code = Arrays.stream(server.accounts().account(presale.get().getKeyPair()).getBalances()).filter(b -> b.getAssetCode().equals(config.getProperty("COIN_CODE"))).findFirst();
+                if (coin_code.isPresent()) {
+                    balance = coin_code.get().getBalance();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            DecimalFormat formatter = new DecimalFormat("#00000000000.0000000");
+            Transaction dXlm = new Transaction.Builder(StellarUtil.getAccountResponse(server, presale.get(), 6))
+                    .addOperation(
+                            new ManageOfferOperation.Builder(appAsset, new AssetTypeNative(), String.valueOf(formatter.format(Double.valueOf(balance)/3)), config.getProperty("COIN_INIT_XLM_PRICE")).build())
+                    .build();
+            StellarUtil.performTx(server, presale.get().getKeyPair(), dXlm, 7);
+
+            Transaction dBtc = new Transaction.Builder(StellarUtil.getAccountResponse(server, presale.get(), 6))
+                    .addOperation(
+                            new ManageOfferOperation.Builder(appAsset, btcAsset, String.valueOf(formatter.format(Double.valueOf(balance)/3)), config.getProperty("COIN_INIT_BTC_PRICE")).build())
+                    .build();
+            StellarUtil.performTx(server, presale.get().getKeyPair(), dBtc, 7);
+
+            Transaction dEth = new Transaction.Builder(StellarUtil.getAccountResponse(server, presale.get(), 6))
+                    .addOperation(
+                            new ManageOfferOperation.Builder(appAsset, ethAsset, String.valueOf(formatter.format(Double.valueOf(balance)/3)), config.getProperty("COIN_INIT_ETH_PRICE")).build())
+                    .build();
+            StellarUtil.performTx(server, presale.get().getKeyPair(), dEth, 7);
+
+
+
+            System.out.println("---------------------------------");
+            System.out.println("Token created.");
+            if (network.equals(NetworkType.TESTNET)) {
+                System.out.println("First open https://stellarterm.com/#testnet and open then in the same tab the following URL:");
+            }
+            System.out.println("You can now trade it on https://stellarterm.com/#exchange/" + config.getProperty("COIN_CODE") + "-" + issuer.getKeyPair().getAccountId() + "/XLM-native");
+
+            // Step 8 - Create test Account which buys Tokens
+            if (network.equals(NetworkType.TESTNET) && Boolean.valueOf(config.getProperty("USER_ENABLED"))) {
+                final IAccount tester = AccountFactory.create("TestUser", network, AccountType.USER);
+
+                Transaction trustUser = new Transaction.Builder(StellarUtil.getAccountResponse(server, tester, 3))
+                        .addOperation(
+                                new ChangeTrustOperation.Builder(appAsset, config.getProperty("COIN_AMOUNT")).build())
+                        .build();   // the receiving account must trust the asset with maximum amount
+                StellarUtil.performTx(server, tester.getKeyPair(), trustUser, 8);
+
+                Transaction offerBuy = new Transaction.Builder(StellarUtil.getAccountResponse(server, tester, 8))
+                        .addOperation(
+                                new ManageOfferOperation.Builder(new AssetTypeNative(), appAsset, config.getProperty("USER_OFFER_SELL_AMOUNT"), config.getProperty("USER_OFFER_PRICE_SELL")).build())
+                        .build();   // set master weight of issuer to lock him to max COIN_AMOUNT
+                StellarUtil.performTx(server, tester.getKeyPair(), offerBuy, 8);
+
+                Transaction offerBid = new Transaction.Builder(StellarUtil.getAccountResponse(server, tester, 8))
+                        .addOperation(
+                                new ManageOfferOperation.Builder(new AssetTypeNative(), appAsset, config.getProperty("USER_OFFER_SELL_AMOUNT"), config.getProperty("USER_OFFER_PRICE_SOLD")).build())
+                        .build();   // set master weight of issuer to lock him to max COIN_AMOUNT
+                StellarUtil.performTx(server, tester.getKeyPair(), offerBid, 8);
+                System.out.println("Checkout my balance: " + StellarUtil.getNetworkUrl(network) + "/accounts/" + tester.getKeyPair().getAccountId());
+            }
+        }
+    }
+
+    private static IAccount getIssuer(Map<String, String> paramsMap, NetworkType network) {
+        IAccount issuer = null;
+        if (paramsMap.get("type").equals("presale") || paramsMap.get("type").equals("directico")) {
+            issuer = AccountFactory.create(AccountType.ISSUER.name().toLowerCase(), network, AccountType.ISSUER);
+        } else {
+            issuer = new AccountImpl(AccountType.ISSUER, KeyPair.fromSecretSeed(paramsMap.get("secret")));
+        }
+        return issuer;
+    }
+
+    private static void createAccAndToken(Server server, IAccount account, Asset appAsset, Properties config, IAccount issuer, String amount, NetworkType network) {
+        // Step 3 – Trust the issuing account
+        trust(server, account, appAsset, config);
+
+        // Step 4 – Create tokens
+        Transaction send = new Transaction.Builder(StellarUtil.getAccountResponse(server, issuer, 4))
+                .addOperation(
+                        new PaymentOperation.Builder(account.getKeyPair(), appAsset, amount).build())
+                .build();   // there has to be a payment to create the token. We send all from issuer to distributor
+        StellarUtil.performTx(server, issuer.getKeyPair(), send, 4);
+
+        System.out.println("\tINFO: Sent " + amount + " from issuer to " + account.getName() + ".");
+        System.out.println("\tINFO: Checkout my balance: " + StellarUtil.getNetworkUrl(network) + "/accounts/" + account.getKeyPair().getAccountId());
+    }
+
+    private static void trust(Server server, IAccount account, Asset asset, Properties config) {
+        Transaction trust = new Transaction.Builder(StellarUtil.getAccountResponse(server, account, 3))
+                .addOperation(
+                        new ChangeTrustOperation.Builder(asset, config.getProperty("COIN_AMOUNT")).build())
+                .build();   // the receiving account must trust the asset with maximum amount
+        StellarUtil.performTx(server, account.getKeyPair(), trust, 3);
     }
 }
